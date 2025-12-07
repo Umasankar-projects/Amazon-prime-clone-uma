@@ -1,0 +1,191 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        CLUSTER_NAME = 'amazon-prime-cluster'
+        VPC_ID = 'vpc-03f6bf91050b735a4'  // Replace with your VPC ID
+    }
+
+    parameters {
+        string(name: 'CLUSTER_NAME', defaultValue: 'amazon-prime-cluster', description: 'EKS Cluster name')
+        string(name: 'VPC_ID', defaultValue: 'vpc-03f6bf91050b735a4', description: 'VPC ID to cleanup')
+        booleanParam(name: 'FORCE_CLEAN', defaultValue: false, description: 'Force delete everything (ENIs, SGs, etc)')
+    }
+
+    stages {
+        stage('Login to AWS/EKS') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'),
+                                     string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
+                        sh """
+                        aws configure set region ${env.AWS_REGION}
+                        aws eks update-kubeconfig --region ${env.AWS_REGION} --name ${params.CLUSTER_NAME} || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Step 1: Delete Kubernetes Services/LoadBalancers') {
+            steps {
+                sh """
+                echo "🗑️ Deleting LoadBalancer services..."
+                kubectl delete svc --all-namespaces -l service.beta.kubernetes.io/aws-load-balancer-type=nlb --ignore-not-found=true || true
+                kubectl delete svc --all-namespaces -l service.beta.kubernetes.io/aws-load-balancer-type=elb --ignore-not-found=true || true
+                kubectl delete svc --all-namespaces --ignore-not-found=true || true
+                sleep 30
+                echo "✅ K8s services cleaned"
+                """
+            }
+        }
+
+        stage('Step 2: Delete ArgoCD & Prometheus') {
+            steps {
+                sh """
+                echo "🐙 Deleting ArgoCD..."
+                kubectl delete -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --ignore-not-found=true || true
+                kubectl delete ns argocd --ignore-not-found=true || true
+                
+                echo "📊 Deleting Prometheus..."
+                helm uninstall kube-prometheus-stack -n prometheus || true
+                kubectl delete ns prometheus --ignore-not-found=true || true
+                sleep 60
+                echo "✅ Monitoring cleaned"
+                """
+            }
+        }
+
+        stage('Step 3: Delete EKS Node Groups') {
+            steps {
+                sh """
+                echo "🏗️ Deleting node groups..."
+                aws eks list-nodegroups --cluster-name ${params.CLUSTER_NAME} --region ${env.AWS_REGION} \
+                  | jq -r '.nodegroups[]' \
+                  | xargs -I {} aws eks delete-nodegroup \
+                      --cluster-name ${params.CLUSTER_NAME} \
+                      --nodegroup-name {} \
+                      --region ${env.AWS_REGION} || true
+                sleep 120
+                echo "✅ Node groups deleted"
+                """
+            }
+        }
+
+        stage('Step 4: Delete EKS Cluster') {
+            steps {
+                sh """
+                echo "☁️ Deleting EKS cluster..."
+                aws eks delete-cluster --name ${params.CLUSTER_NAME} --region ${env.AWS_REGION} || true
+                echo "⏳ Waiting 5 mins for EKS cleanup..."
+                sleep 300
+                echo "✅ EKS cluster deletion initiated"
+                """
+            }
+        }
+
+        stage('Step 5: Nuclear Cleanup - ENIs/LBs/SGs') {
+            when {
+                expression { params.FORCE_CLEAN == true }
+            }
+            steps {
+                sh """
+                echo "💣 FORCE CLEANUP MODE ACTIVATED"
+                
+                # Delete Load Balancers
+                echo "🗑️ Load Balancers..."
+                aws elbv2 describe-load-balancers --region ${env.AWS_REGION} \
+                  --query 'LoadBalancers[*].LoadBalancerArn' --output text \
+                  | xargs -I {} aws elbv2 delete-load-balancer --load-balancer-arn {} --region ${env.AWS_REGION} || true
+                
+                # Delete Security Groups
+                echo "🔒 Security Groups..."
+                aws ec2 describe-security-groups --filters Name=vpc-id,Values=${params.VPC_ID} \
+                  --query 'SecurityGroups[*].GroupId' --output text \
+                  | xargs -I {} aws ec2 delete-security-groups --group-ids {} --region ${env.AWS_REGION} || true
+                
+                # Unmap Public IPs
+                echo "🌐 Public IPs..."
+                aws ec2 describe-addresses --filters Name=domain,Values=vpc \
+                  --query 'Addresses[*].AllocationId' --output text \
+                  | xargs -I {} aws ec2 release-address --allocation-id {} --region ${env.AWS_REGION} || true
+                
+                sleep 60
+                echo "✅ Nuclear cleanup complete"
+                """
+            }
+        }
+
+        stage('Step 6: Delete Orphaned ENIs') {
+            steps {
+                sh """
+                echo "🔌 Deleting ENIs in VPC ${params.VPC_ID}..."
+                ENIS=\$(aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=${params.VPC_ID} \
+                         --region ${env.AWS_REGION} --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text)
+                
+                for eni in \$ENIS; do
+                    if [ -n "\$eni" ]; then
+                        echo "Deleting ENI: \$eni"
+                        aws ec2 delete-network-interface --network-interface-id \$eni --region ${env.AWS_REGION} || true
+                    fi
+                done
+                
+                echo "✅ ENIs cleaned"
+                """
+            }
+        }
+
+        stage('Step 7: Final AWS Cleanup') {
+            steps {
+                sh """
+                echo "🧹 Final cleanup..."
+                
+                # Delete NAT Gateways
+                aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=${params.VPC_ID} \
+                  --region ${env.AWS_REGION} --query 'NatGateways[*].NatGatewayId' --output text \
+                  | xargs -I {} aws ec2 delete-nat-gateway --nat-gateway-id {} --region ${env.AWS_REGION} || true
+                
+                # Delete Route Tables (non-default)
+                aws ec2 describe-route-tables --filters Name=vpc-id,Values=${params.VPC_ID} \
+                  --region ${env.AWS_REGION} --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text \
+                  | xargs -I {} aws ec2 delete-route-table --route-table-id {} --region ${env.AWS_REGION} || true
+                
+                sleep 120
+                echo "✅ Final cleanup complete"
+                """
+            }
+        }
+
+        stage('Validation - Cluster Clean') {
+            steps {
+                sh """
+                echo "🔍 VALIDATION:"
+                echo "EKS Cluster:"
+                aws eks describe-cluster --name ${params.CLUSTER_NAME} --region ${env.AWS_REGION} || echo "✅ EKS gone"
+                
+                echo -e "\\nENIs:"
+                aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=${params.VPC_ID} \
+                  --region ${env.AWS_REGION} --query 'length(NetworkInterfaces)' --output text || echo "✅ No ENIs"
+                
+                echo -e "\\nLoad Balancers:"
+                aws elbv2 describe-load-balancers --region ${env.AWS_REGION} --query 'length(LoadBalancers)' --output text || echo "✅ No LBs"
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "📋 CLEANUP COMPLETE - Cluster: ${params.CLUSTER_NAME}"
+            echo "💡 Run 'terraform destroy' after 10 mins for VPC cleanup"
+        }
+        success {
+            echo "✅ ✅ FULL EKS CLEANUP SUCCESSFUL! ✅ ✅"
+            echo "🎉 Ready for terraform destroy"
+        }
+        failure {
+            echo "⚠️ Some resources may remain. Check AWS Console."
+        }
+    }
+}

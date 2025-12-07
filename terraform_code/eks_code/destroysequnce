@@ -1,0 +1,7 @@
+1. Node groups scale to 0 → Delete
+2. Addons (coredns, vpc-cni) → Delete  
+3. Cluster → Delete
+4. NAT Gateway → Delete
+5. Subnets → Delete
+6. IGW → Delete
+7. VPC → Delete ✅
