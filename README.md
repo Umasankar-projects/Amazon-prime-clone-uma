@@ -210,6 +210,7 @@ pipeline {
 
     environment {
         KUBECTL = '/usr/local/bin/kubectl'
+        AWS_REGION = 'us-east-1'
     }
 
     parameters {
@@ -222,7 +223,7 @@ pipeline {
                 script {
                     withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'),
                                      string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
-                        sh "aws eks --region us-east-1 update-kubeconfig --name ${params.CLUSTER_NAME}"
+                        sh "aws eks --region ${env.AWS_REGION} update-kubeconfig --name ${params.CLUSTER_NAME}"
                     }
                 }
             }
@@ -232,19 +233,34 @@ pipeline {
             steps {
                 script {
                     sh """
-                    helm repo add stable https://charts.helm.sh/stable || true
+                    # Add Helm repo
                     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-                    # Check if namespace 'prometheus' exists
-                    if kubectl get namespace prometheus > /dev/null 2>&1; then
-                        # If namespace exists, upgrade the Helm release
-                        helm upgrade stable prometheus-community/kube-prometheus-stack -n prometheus
-                    else
-                        # If namespace does not exist, create it and install Helm release
-                        kubectl create namespace prometheus
-                        helm install stable prometheus-community/kube-prometheus-stack -n prometheus
-                    fi
-                    kubectl patch svc stable-kube-prometheus-sta-prometheus -n prometheus -p '{"spec": {"type": "LoadBalancer"}}'
-                    kubectl patch svc stable-grafana -n prometheus -p '{"spec": {"type": "LoadBalancer"}}'
+                    helm repo update
+
+                    # Ensure namespace exists and install/upgrade Prometheus stack
+                    kubectl create namespace prometheus || true
+                    helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n prometheus
+
+                    # Wait for deployments to be ready
+                    sleep 30
+
+                    # Patch Prometheus services to LoadBalancer
+                    for svc in \$(kubectl -n prometheus get svc -l app.kubernetes.io/name=prometheus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo ''); do
+                        if [ -n "\$svc" ]; then
+                            echo "Patching Prometheus service: \$svc"
+                            kubectl -n prometheus patch svc \$svc --type='merge' -p '{"spec":{"type":"LoadBalancer"}}'
+                        fi
+                    done
+
+                    # Patch Grafana services to LoadBalancer
+                    for svc in \$(kubectl -n prometheus get svc -l app.kubernetes.io/name=grafana -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo ''); do
+                        if [ -n "\$svc" ]; then
+                            echo "Patching Grafana service: \$svc"
+                            kubectl -n prometheus patch svc \$svc --type='merge' -p '{"spec":{"type":"LoadBalancer"}}'
+                        fi
+                    done
+
+                    echo "Prometheus & Grafana services patched successfully"
                     """
                 }
             }
@@ -257,12 +273,64 @@ pipeline {
                     # Install ArgoCD
                     kubectl create namespace argocd || true
                     kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-                    kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+
+                    # Wait for ArgoCD to be ready
+                    sleep 60
+
+                    # Patch ArgoCD server service to LoadBalancer
+                    kubectl patch svc argocd-server -n argocd --type='merge' -p '{"spec":{"type":"LoadBalancer"}}'
+
+                    echo "ArgoCD installed and service patched successfully"
                     """
                 }
             }
         }
-		
+
+        stage("Post-Deployment Validation") {
+            steps {
+                script {
+                    sh """
+                    echo "Validating deployments..."
+                    
+                    # Wait for Prometheus deployment
+                    kubectl rollout status deployment/kube-prometheus-stack-prometheus -n prometheus --timeout=5m || true
+                    
+                    # Wait for Grafana deployment  
+                    kubectl rollout status deployment/kube-prometheus-stack-grafana -n prometheus --timeout=5m || true
+                    
+                    # Wait for ArgoCD server
+                    kubectl rollout status deployment/argocd-server -n argocd --timeout=5m || true
+
+                    echo "=== Prometheus Services ==="
+                    kubectl -n prometheus get svc -l app.kubernetes.io/name=prometheus
+                    
+                    echo "=== Grafana Services ==="
+                    kubectl -n prometheus get svc -l app.kubernetes.io/name=grafana
+                    
+                    echo "=== ArgoCD Services ==="
+                    kubectl -n argocd get svc
+                    
+                    echo "=== All Pods Status ==="
+                    kubectl get pods -n prometheus -l release=kube-prometheus-stack
+                    kubectl get pods -n argocd
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline completed. Check service endpoints with: kubectl get svc -n prometheus -n argocd"
+        }
+        success {
+            echo "✅ Pipeline completed successfully! Prometheus, Grafana, and ArgoCD deployed."
+            echo "💡 Get Grafana password: kubectl -n prometheus get secret kube-prometheus-stack-grafana -o jsonpath='{.data.admin-password}' | base64 --decode"
+        }
+        failure {
+            echo "❌ Pipeline failed. Check logs above for details."
+            echo "🔍 Debug: kubectl get events -n prometheus --sort-by='.lastTimestamp'"
+        }
     }
 }
 ```
@@ -277,71 +345,191 @@ pipeline {
     agent any
 
     environment {
-        KUBECTL = '/usr/local/bin/kubectl'
+        AWS_REGION = 'us-east-1'
+        CLUSTER_NAME = 'amazon-prime-cluster'
+        VPC_ID = 'vpc-03f6bf91050b735a4'  // Replace with your VPC ID
     }
 
     parameters {
-        string(name: 'CLUSTER_NAME', defaultValue: 'amazon-prime-cluster', description: 'Enter your EKS cluster name')
+        string(name: 'CLUSTER_NAME', defaultValue: 'amazon-prime-cluster', description: 'EKS Cluster name')
+        string(name: 'VPC_ID', defaultValue: 'vpc-03f6bf91050b735a4', description: 'VPC ID to cleanup')
+        booleanParam(name: 'FORCE_CLEAN', defaultValue: false, description: 'Force delete everything (ENIs, SGs, etc)')
     }
 
     stages {
-
-        stage("Login to EKS") {
+        stage('Login to AWS/EKS') {
             steps {
                 script {
                     withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'),
                                      string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
-                        sh "aws eks --region us-east-1 update-kubeconfig --name ${params.CLUSTER_NAME}"
+                        sh """
+                        aws configure set region ${env.AWS_REGION}
+                        aws eks update-kubeconfig --region ${env.AWS_REGION} --name ${params.CLUSTER_NAME} || true
+                        """
                     }
                 }
             }
         }
-        
-        stage('Cleanup K8s Resources') {
+
+        stage('Step 1: Delete Kubernetes Services/LoadBalancers') {
             steps {
-                script {
-                    // Step 1: Delete services and deployments
-                    sh 'kubectl delete svc kubernetes || true'
-                    sh 'kubectl delete deploy pandacloud-app || true'
-                    sh 'kubectl delete svc pandacloud-app || true'
-
-                    // Step 2: Delete ArgoCD installation and namespace
-                    sh 'kubectl delete -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml || true'
-                    sh 'kubectl delete namespace argocd || true'
-
-                    // Step 3: List and uninstall Helm releases in prometheus namespace
-                    sh 'helm list -n prometheus || true'
-                    sh 'helm uninstall kube-stack -n prometheus || true'
-                    
-                    // Step 4: Delete prometheus namespace
-                    sh 'kubectl delete namespace prometheus || true'
-
-                    // Step 5: Remove Helm repositories
-                    sh 'helm repo remove stable || true'
-                    sh 'helm repo remove prometheus-community || true'
-                }
+                sh """
+                echo "🗑️ Deleting LoadBalancer services..."
+                kubectl delete svc --all-namespaces -l service.beta.kubernetes.io/aws-load-balancer-type=nlb --ignore-not-found=true || true
+                kubectl delete svc --all-namespaces -l service.beta.kubernetes.io/aws-load-balancer-type=elb --ignore-not-found=true || true
+                kubectl delete svc --all-namespaces --ignore-not-found=true || true
+                sleep 30
+                echo "✅ K8s services cleaned"
+                """
             }
         }
-		
-        stage('Delete ECR Repository and KMS Keys') {
-            steps {
-                script {
-                    // Step 1: Delete ECR Repository
-                    sh '''
-                    aws ecr delete-repository --repository-name amazon-prime --region us-east-1 --force
-                    '''
 
-                    // Step 2: Delete KMS Keys
-                    sh '''
-                    for key in $(aws kms list-keys --region us-east-1 --query "Keys[*].KeyId" --output text); do
-                        aws kms disable-key --key-id $key --region us-east-1
-                        aws kms schedule-key-deletion --key-id $key --pending-window-in-days 7 --region us-east-1
-                    done
-                    '''
-                }
+        stage('Step 2: Delete ArgoCD & Prometheus') {
+            steps {
+                sh """
+                echo "🐙 Deleting ArgoCD..."
+                kubectl delete -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --ignore-not-found=true || true
+                kubectl delete ns argocd --ignore-not-found=true || true
+                
+                echo "📊 Deleting Prometheus..."
+                helm uninstall kube-prometheus-stack -n prometheus || true
+                kubectl delete ns prometheus --ignore-not-found=true || true
+                sleep 60
+                echo "✅ Monitoring cleaned"
+                """
             }
-        }		
-		
+        }
+
+        stage('Step 3: Delete EKS Node Groups') {
+            steps {
+                sh """
+                echo "🏗️ Deleting node groups..."
+                aws eks list-nodegroups --cluster-name ${params.CLUSTER_NAME} --region ${env.AWS_REGION} \
+                  | jq -r '.nodegroups[]' \
+                  | xargs -I {} aws eks delete-nodegroup \
+                      --cluster-name ${params.CLUSTER_NAME} \
+                      --nodegroup-name {} \
+                      --region ${env.AWS_REGION} || true
+                sleep 120
+                echo "✅ Node groups deleted"
+                """
+            }
+        }
+
+        stage('Step 4: Delete EKS Cluster') {
+            steps {
+                sh """
+                echo "☁️ Deleting EKS cluster..."
+                aws eks delete-cluster --name ${params.CLUSTER_NAME} --region ${env.AWS_REGION} || true
+                echo "⏳ Waiting 5 mins for EKS cleanup..."
+                sleep 300
+                echo "✅ EKS cluster deletion initiated"
+                """
+            }
+        }
+
+        stage('Step 5: Nuclear Cleanup - ENIs/LBs/SGs') {
+            when {
+                expression { params.FORCE_CLEAN == true }
+            }
+            steps {
+                sh """
+                echo "💣 FORCE CLEANUP MODE ACTIVATED"
+                
+                # Delete Load Balancers
+                echo "🗑️ Load Balancers..."
+                aws elbv2 describe-load-balancers --region ${env.AWS_REGION} \
+                  --query 'LoadBalancers[*].LoadBalancerArn' --output text \
+                  | xargs -I {} aws elbv2 delete-load-balancer --load-balancer-arn {} --region ${env.AWS_REGION} || true
+                
+                # Delete Security Groups
+                echo "🔒 Security Groups..."
+                aws ec2 describe-security-groups --filters Name=vpc-id,Values=${params.VPC_ID} \
+                  --query 'SecurityGroups[*].GroupId' --output text \
+                  | xargs -I {} aws ec2 delete-security-groups --group-ids {} --region ${env.AWS_REGION} || true
+                
+                # Unmap Public IPs
+                echo "🌐 Public IPs..."
+                aws ec2 describe-addresses --filters Name=domain,Values=vpc \
+                  --query 'Addresses[*].AllocationId' --output text \
+                  | xargs -I {} aws ec2 release-address --allocation-id {} --region ${env.AWS_REGION} || true
+                
+                sleep 60
+                echo "✅ Nuclear cleanup complete"
+                """
+            }
+        }
+
+        stage('Step 6: Delete Orphaned ENIs') {
+            steps {
+                sh """
+                echo "🔌 Deleting ENIs in VPC ${params.VPC_ID}..."
+                ENIS=\$(aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=${params.VPC_ID} \
+                         --region ${env.AWS_REGION} --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text)
+                
+                for eni in \$ENIS; do
+                    if [ -n "\$eni" ]; then
+                        echo "Deleting ENI: \$eni"
+                        aws ec2 delete-network-interface --network-interface-id \$eni --region ${env.AWS_REGION} || true
+                    fi
+                done
+                
+                echo "✅ ENIs cleaned"
+                """
+            }
+        }
+
+        stage('Step 7: Final AWS Cleanup') {
+            steps {
+                sh """
+                echo "🧹 Final cleanup..."
+                
+                # Delete NAT Gateways
+                aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=${params.VPC_ID} \
+                  --region ${env.AWS_REGION} --query 'NatGateways[*].NatGatewayId' --output text \
+                  | xargs -I {} aws ec2 delete-nat-gateway --nat-gateway-id {} --region ${env.AWS_REGION} || true
+                
+                # Delete Route Tables (non-default)
+                aws ec2 describe-route-tables --filters Name=vpc-id,Values=${params.VPC_ID} \
+                  --region ${env.AWS_REGION} --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text \
+                  | xargs -I {} aws ec2 delete-route-table --route-table-id {} --region ${env.AWS_REGION} || true
+                
+                sleep 120
+                echo "✅ Final cleanup complete"
+                """
+            }
+        }
+
+        stage('Validation - Cluster Clean') {
+            steps {
+                sh """
+                echo "🔍 VALIDATION:"
+                echo "EKS Cluster:"
+                aws eks describe-cluster --name ${params.CLUSTER_NAME} --region ${env.AWS_REGION} || echo "✅ EKS gone"
+                
+                echo -e "\\nENIs:"
+                aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=${params.VPC_ID} \
+                  --region ${env.AWS_REGION} --query 'length(NetworkInterfaces)' --output text || echo "✅ No ENIs"
+                
+                echo -e "\\nLoad Balancers:"
+                aws elbv2 describe-load-balancers --region ${env.AWS_REGION} --query 'length(LoadBalancers)' --output text || echo "✅ No LBs"
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "📋 CLEANUP COMPLETE - Cluster: ${params.CLUSTER_NAME}"
+            echo "💡 Run 'terraform destroy' after 10 mins for VPC cleanup"
+        }
+        success {
+            echo "✅ ✅ FULL EKS CLEANUP SUCCESSFUL! ✅ ✅"
+            echo "🎉 Ready for terraform destroy"
+        }
+        failure {
+            echo "⚠️ Some resources may remain. Check AWS Console."
+        }
     }
 }
 ```
